@@ -261,6 +261,12 @@ class Attention(nn.Module):
         self.attn_on_attn = on_attn
         self.to_out = nn.Sequential(nn.Linear(inner_dim, dim * 2), nn.GLU()) if on_attn else nn.Linear(inner_dim, dim)
 
+        max_pos_emb = 256
+        self.max_pos_emb = max_pos_emb
+        self.rel_pos_emb = nn.Embedding(2 * max_pos_emb + 1, dim_head)
+        self.rel_to_q = nn.Linear(dim_head, dim_head, bias = False)
+        self.rel_to_k = nn.Linear(dim_head, dim_head, bias = False)
+
     def forward(
         self,
         x,
@@ -313,6 +319,25 @@ class Attention(nn.Module):
 
         dots = einsum('b h i d, b h j d -> b h i j', q, k) * self.scale
         mask_value = max_neg_value(dots)
+
+
+        # inefficient RPE - deberta style
+
+        max_pos_emb = self.max_pos_emb
+        seq = torch.arange(n, device = device)
+        dist = seq[:, None] - seq[None, :]
+        dist = dist.clip(-max_pos_emb, max_pos_emb) + max_pos_emb
+        rel_pos_emb = self.rel_pos_emb(dist).to(q)
+
+        rel_pos_q = self.rel_to_q(rel_pos_emb)
+        rel_pos_k = self.rel_to_k(rel_pos_emb)
+
+        pos_attn_q = einsum('b h n d, n r d -> b h n r', q, rel_pos_k) * self.scale
+        pos_attn_k = einsum('b h r d, n r d -> b h n r', q, rel_pos_q) * self.scale
+
+        dots = (dots + pos_attn_q + pos_attn_k) / 3
+
+        # /rpe
 
         if exists(prev_attn):
             dots = dots + prev_attn
