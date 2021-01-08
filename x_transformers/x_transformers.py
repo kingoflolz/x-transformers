@@ -304,14 +304,11 @@ class Attention(nn.Module):
             k_mask = rearrange(k_mask, 'b j -> b () () j')
             input_mask = q_mask * k_mask
 
-        if self.num_mem_kv > 0:
-            mem_k, mem_v = map(lambda t: repeat(t, 'h n d -> b h n d', b = b), (self.mem_k, self.mem_v))
-            k = torch.cat((mem_k, k), dim = -2)
-            v = torch.cat((mem_v, v), dim = -2)
-            if exists(input_mask):
-                input_mask = F.pad(input_mask, (self.num_mem_kv, 0), value = True)
-
         dots = einsum('b h i d, b h j d -> b h i j', q, k) * self.scale
+
+        if self.num_mem_kv > 0:
+            dots_mem = einsum('b h i d, h j d -> b h i j', q, self.mem_k) * self.scale
+
         mask_value = max_neg_value(dots)
 
         if exists(prev_attn):
@@ -342,7 +339,19 @@ class Attention(nn.Module):
             dots.masked_fill_(mask, mask_value)
             del mask
 
+        if self.num_mem_kv > 0:
+            dots = torch.cat([dots, dots_mem], dim = -1)
+
         attn = self.attn_fn(dots, dim = -1)
+
+        if self.num_mem_kv > 0:
+            attn_kv = attn[:, :, :, kv_input.shape[-2]:]
+            attn = attn[:, :, :, :kv_input.shape[-2]]
+
+            kv_out = einsum('b h i j, h j d -> b h i d', attn_kv, self.mem_v)
+        else:
+            kv_out = 0
+
         post_softmax_attn = attn
 
         attn = self.dropout(attn)
@@ -350,7 +359,7 @@ class Attention(nn.Module):
         if talking_heads:
             attn = einsum('b h i j, h k -> b k i j', attn, self.post_softmax_proj).contiguous()
 
-        out = einsum('b h i j, b h j d -> b h i d', attn, v)
+        out = einsum('b h i j, b h j d -> b h i d', attn, v) + kv_out
         out = rearrange(out, 'b h n d -> b n (h d)')
 
         intermediates = Intermediates(
@@ -358,7 +367,7 @@ class Attention(nn.Module):
             post_softmax_attn = post_softmax_attn
         )
 
-        return self.to_out(out), intermediates
+        return self.to_out(out) + out, intermediates
 
 class AttentionLayers(nn.Module):
     def __init__(
